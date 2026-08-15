@@ -1,0 +1,31 @@
+name: localtask-mcp
+arch: amd64
+platform: linux
+version: 0.1.0
+release: "1"
+section: utils
+priority: optional
+maintainer: localtask
+description: |
+  Go MCP server exposing host-management (shell exec, file read/write, directory
+  listing, system info, process/disk/memory stats, kubectl) as MCP tools over
+  stdio or streamable HTTP with multi-key bearer auth and optional TLS.
+vendor: localtask
+homepage: ""
+license: MIT
+
+contents:
+  - src: ./dist/localtask-mcp-amd64
+    dst: /usr/local/bin/localtask-mcp
+    file_info: {mode: 0755}
+  - src: ./localtask-mcp.system.service
+    dst: /usr/lib/systemd/system/localtask-mcp.service
+    file_info: {mode: 0644}
+    type: config|noreplace
+  - dst: /etc/localtask
+    type: dir
+    file_info: {mode: 0750}
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh

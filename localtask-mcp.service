@@ -1,0 +1,63 @@
+# localtask MCP server — user-level systemd unit.
+#
+# Portable: all paths go through %h (the owning user's home dir for a
+# --user instance), so this same file works on any Linux host once the
+# project is placed at $HOME/localtask and the binary has the embed key
+# baked in.
+#
+# Deploy (per host):
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf "$HOME/localtask/localtask-mcp.service" \
+#       ~/.config/systemd/user/localtask-mcp.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now localtask-mcp
+#   journalctl --user -u localtask-mcp -f
+#
+# Per-host knobs (edit below, then daemon-reload + restart):
+#   - listen address: 0.0.0.0 binds every interface (LAN-reachable); 127.0.0.1
+#     binds loopback only (host-local, safest). Bearer keys grant FULL host
+#     control (arbitrary shell + any file R/W), so plain HTTP off-host means
+#     anyone on the same network can sniff the key over the wire. Only run
+#     0.0.0.0 + no TLS on a trusted network. For off-host use over an
+#     untrusted network, bind 0.0.0.0 AND enable TLS (-tls-selfsigned or
+#     -cert/-key) instead.
+#   - port: change 8011 below.
+#   - TLS (optional): append -tls-selfsigned (auto ECDSA self-signed) or -cert/-key.
+
+[Unit]
+Description=localtask MCP server (HTTP, multi-key bearer, optional TLS)
+After=network-online.target
+Wants=network-online.target
+# Restart rate-limitting (newer systemd parses these in [Unit], not [Service]).
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/localtask
+# %h = the user's home dir, so this is portable across hosts/users.
+ExecStart=%h/localtask/localtask-mcp \
+  -http 0.0.0.0:8011 \
+  -keys %h/localtask/keys.json.enc
+
+# If keys.json.enc is missing or cannot be decrypted (no/wrong embedKey baked
+# into the binary), the server exits non-zero and systemd restarts it. It keeps
+# failing until a valid encrypted keys file is provided — no service exposed.
+Restart=on-failure
+RestartSec=3s
+
+# Hardening (best-effort; relax if something breaks). NOTE: the server can run
+# arbitrary shell commands and write files anywhere as its user, so we do NOT
+# sandbox the filesystem broadly — that would break the exec/write tools.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/localtask
+
+# Logs go to journald: journalctl --user -u localtask-mcp -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

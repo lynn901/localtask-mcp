@@ -1,0 +1,23 @@
+# Secrets — NEVER commit. Both the plaintext archive (real bearer keys) and
+# the encrypted file are bound to the embedKey baked into the binary; either
+# would leak keys.
+keys.json
+keys.json.*
+keys.json.enc
+keys.json.bak
+keys.json.PLAINTEXT-ARCHIVE
+
+# Binaries — the runtime binary has the embedKey baked in via -ldflags, so
+# committing it would leak the AES key (extractable with `strings`). Build
+# artifacts and cross-compiled outputs belong to the build step, not the repo.
+/localtask-mcp
+/dist/
+
+# Editor/OS cruft
+*.swp
+.DS_Store
+
+# Local MCP client config + Claude session data (machine-specific, may carry
+# local paths or tokens).
+/.mcp.json
+/.claude/

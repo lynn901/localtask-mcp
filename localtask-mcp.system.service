@@ -1,0 +1,56 @@
+# localtask MCP server — system-level systemd unit (for RPM deployment).
+#
+# Installed by the RPM to /usr/lib/systemd/system/localtask-mcp.service.
+# Runs at boot (no login needed), unlike a --user unit. Bind/port/keys are
+# configured below; the binary (with embedKey baked in) and keys.json.enc are
+# provided by the package / the admin.
+#
+# Enable: sudo systemctl daemon-reload && sudo systemctl enable --now localtask-mcp
+# Logs:   sudo journalctl -u localtask-mcp -f
+#
+# Per-host knobs (edit, then: sudo systemctl daemon-reload && sudo systemctl restart localtask-mcp):
+#   - listen address: 0.0.0.0 binds every interface (LAN-reachable); 127.0.0.1
+#     is loopback only. Bearer keys grant FULL host control (arbitrary shell +
+#     any file R/W), so plain HTTP off-host means the key is sniffable on the
+#     wire. Only run 0.0.0.0 + no TLS on a trusted network; for untrusted
+#     networks add TLS (-tls-selfsigned or -cert/-key).
+#   - port: change 8011 below.
+#   - keys file: /etc/localtask/keys.json.enc (encrypted with the embedKey baked
+#     into /usr/local/bin/localtask-mcp). Re-encrypt with the package binary
+#     when rotating keys.
+
+[Unit]
+Description=localtask MCP server (HTTP, multi-key bearer, optional TLS)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Runs as root by default so exec/write tools act with full host access, as the
+# original server.py did. To drop to an unprivileged user, set User= and ensure
+# that user can read /etc/localtask and write wherever the tools need to.
+# User=localtask
+WorkingDirectory=/etc/localtask
+ExecStart=/usr/local/bin/localtask-mcp \
+  -http 0.0.0.0:8011 \
+  -keys /etc/localtask/keys.json.enc
+
+# If keys.json.enc is missing or cannot be decrypted (no/wrong embedKey baked
+# into the binary), the server exits non-zero and systemd restarts it. It keeps
+# failing until a valid encrypted keys file is provided — no service exposed.
+Restart=on-failure
+RestartSec=3s
+
+# Hardening (best-effort; relax if something breaks). NOTE: the server can run
+# arbitrary shell commands and write files anywhere as its user, so we do NOT
+# sandbox the filesystem broadly — that would break the exec/write tools.
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
