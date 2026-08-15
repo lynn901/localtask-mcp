@@ -140,15 +140,24 @@ go build -ldflags "-X main.embedKey=$EK2" -o localtask-mcp .
 ./localtask-mcp -encrypt-keys keys.json keys.json.enc   # 用新二进制重加密
 ```
 
-## systemd 部署(HTTP,无 TLS,加密 key)
+## systemd 部署
 
-user 级单元跑在回环 HTTP,从加密 `keys.json.enc` 加载。无需 sudo。unit 文件**在项目内**(`localtask-mcp.service`,单一来源),部署处用**符号链接**指向它,编辑项目文件 + `daemon-reload` 即可生效。
+两种形态,按场景选:
+
+- **user 级**(开发机/单用户):unit 文件在项目内 `localtask-mcp.service`,部署处用**符号链接**指向它(单一来源,改项目文件 + `daemon-reload` 即生效)。路径用 `%h`(用户家目录)跨主机/用户移植。默认登录后才跑;开机自启需 `loginctl enable-linger $USER`。
+- **system 级**(服务器):RPM 装的 `localtask-mcp.system.service` → `/usr/lib/systemd/system/`,开机自启、不依赖登录。见下文 [RPM 打包](#rpm-打包rhel-系服务器部署)。
+
+两个 unit 默认都监听 `0.0.0.0:8011`、无 TLS、从加密 `keys.json.enc` 加载 key。`0.0.0.0` = 所有网卡(内网可达),改 `127.0.0.1` 则只本机。
+
+user 级 unit(项目内 `localtask-mcp.service`):
 
 ```ini
 [Unit]
 Description=localtask MCP server (HTTP, multi-key bearer, optional TLS)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -156,26 +165,30 @@ WorkingDirectory=%h/localtask
 ExecStart=%h/localtask/localtask-mcp -http 0.0.0.0:8011 -keys %h/localtask/keys.json.enc
 Restart=on-failure
 RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/localtask
 
 [Install]
 WantedBy=default.target
 ```
 
-`%h` = user 实例所属用户的家目录,故可跨主机/用户移植。
+安装 user 级(无需 sudo):
 
 ```bash
 mkdir -p ~/.config/systemd/user
 ln -sf "$HOME/localtask/localtask-mcp.service" ~/.config/systemd/user/localtask-mcp.service
 systemctl --user daemon-reload
 systemctl --user enable --now localtask-mcp
-systemctl --user status localtask-mcp
 journalctl --user -u localtask-mcp -f
 ```
 
 注意:
-- 二进制必须带 embedKey 编译过;否则解不开 `keys.json.enc`,服务起不来。
-- 未登录也跑(开机自启)需 `loginctl enable-linger $USER`(可能需权限)。
-- 监听 `0.0.0.0` + 无 TLS:key 在链路明文,仅可信网络用;不可信网络要加 TLS。
+- 二进制必须带 embedKey 编译过;否则解不开 `keys.json.enc`,服务起不来(失败循环重启,不暴露服务)。
+- `0.0.0.0` + 无 TLS:key 在链路明文,仅可信网络用;不可信网络要加 TLS(见 [TLS](#tls))。
+- exec/write 工具要跑任意 shell/写任意路径,故 unit 不做更广文件系统沙箱(会破坏工具);现有硬化项已是上限。
 
 ## RPM 打包(RHEL 系,服务器部署)
 
@@ -213,13 +226,29 @@ SELinux:服务以 root 跑任意 shell + 任意写,enforcing 可能拦 AVC。起
 
 ## TLS
 
-两种:
-1. **自签(自动生成)**:`-tls-selfsigned`,启动时生成 ECDSA(P-256)自签证书(1 年有效,localhost+127.0.0.1),往 stderr 打 **SHA-256 指纹**,客户端 pin 该指纹。适合本地/可信内网。
-2. **自己证书**:`-cert <pem>` + `-key <pem>`(如 Let's Encrypt)。有真域名 + CA 证书用这个。
+默认**明文 HTTP**(无 `-tls-selfsigned`/`-cert`/`-key`)。明文下 bearer key 在链路明文传输——仅可信内网/本机用;要暴露到不可信网络须开 TLS。最低 TLS 1.2。
 
-无 `-tls-selfsigned`/`-cert`/`-key` → 明文 HTTP。最低 TLS 1.2。
+三种启用方式,按场景选:
 
-> 注意:Claude Code 默认严格校验 TLS,**不支持指纹 pin**,只支持 `NODE_EXTRA_CA_CERTS=<pem>` 追加信任。`-tls-selfsigned` 证书只在内存、每次启动换新,故 Claude Code 连不上;要用 HTTPS 接 Claude Code 需固定 PEM(`-cert/-key`)+ `NODE_EXTRA_CA_CERTS` 指向它。
+1. **固定自签 PEM(内网、Claude Code 等需固定证书的客户端)**——推荐用于可信内网要加密的场景。用 `openssl` 生成**一次**证书长期复用,服务用 `-cert/-key` 加载:
+   ```bash
+   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+     -keyout key.pem -out cert.pem -days 3650 -nodes \
+     -subj "/O=localtask-mcp" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+   chmod 600 key.pem cert.pem
+   ./localtask-mcp -http 0.0.0.0:8443 -cert cert.pem -key key.pem -keys keys.json.enc
+   ```
+   Claude Code 客户端设 `NODE_EXTRA_CA_CERTS=/path/to/cert.pem`(追加信任该 PEM)即可连。比 `-tls-selfsigned` 适合 Claude Code:证书固定,不随重启变。
+
+2. **自签自动生成(`-tls-selfsigned`)**——仅适合能关 TLS 校验或支持指纹 pin 的自定义客户端(curl `-k`、自定义 Go 客户端等)。启动时生成 ECDSA(P-256)自签证书(1 年,localhost+127.0.0.1),只存在内存、**每次启动换新**,往 stderr 打 SHA-256 指纹供 pin。证书不落盘、会变,故**不支持** `NODE_EXTRA_CA_CERTS`(无稳定 PEM),Claude Code 连不上。
+   ```bash
+   ./localtask-mcp -http 0.0.0.0:8443 -tls-selfsigned -keys keys.json.enc
+   # 客户端:curl -k ... 或 pin 打印的指纹
+   ```
+
+3. **CA 证书(`-cert/-key`,Let's Encrypt 等)**——有真域名 + CA 证书用这个,Claude Code 等标准客户端自动信任,无需额外配置。
+
+> Claude Code 默认严格校验 TLS(系统 CA + 内置 Mozilla CA),**不支持指纹 pin**,只支持 `NODE_EXTRA_CA_CERTS=<pem>` 追加信任。故 Claude Code 接 HTTPS 自签,用方式 1(固定 PEM)。
 
 ## 客户端配置
 
