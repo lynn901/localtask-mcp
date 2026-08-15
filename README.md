@@ -66,9 +66,9 @@ JSON 数组,每个对象一个 key。字段:
 
 ```json
 [
-  {"key":"4e97a5fdfd9537c60bf1d70eeeae8cd9f87830a9bd8f56ff1d5daf9f8267624c","label":"yuan"},
-  {"key":"9c6eb4d8a5ae64fbd89df4d5edf2cc27b8629720212d35c878cc003cb3652155","label":"zhao"},
-  {"key":"0047c08f15db56158bd5a941291ede1cb5f54edbc5dd5302feb59971fcc4461e","label":"node1","revoked":true}
+  {"key":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","label":"yuan"},
+  {"key":"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210","label":"zhao"},
+  {"key":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","label":"node1","revoked":true}
 ]
 ```
 
