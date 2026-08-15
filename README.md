@@ -331,21 +331,6 @@ claude mcp add --transport http localtask http://127.0.0.1:8011/mcp \
   --header "Authorization: Bearer <your-key>"                               # HTTP
 ```
 
-### 与 server.py 的映射
-
-| server.py action | MCP 工具 | 说明 |
-|---|---|---|
-| exec | `exec` | 同语义,`sh -c` + timeout |
-| read | `read` | UTF-8;二进制用 `download` |
-| write | `write` | 现在自动建父目录 |
-| PUT /upload | `write_bytes` | hex/base64 上传 |
-| list | `list` | tab 分隔输出 |
-| info | `info` | platform 现为 `os/arch` |
-| ps | `ps` | 同名白名单 |
-| df/mem | `df`/`mem` | 相同 |
-| k8s | `k8s` | 同默认+timeout |
-| — | `download` | 二进制安全读为 base64 |
-
 ## 安全
 
 服务以 OS 用户身份运行**任意 shell**、读写**任意可达文件**。专为可信本地/单用户场景(个人自动化桥接)。每个 key = 完整主机控制权,当 root 凭据对待。
