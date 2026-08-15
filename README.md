@@ -19,6 +19,63 @@ go build -o localtask-mcp .
 go test -v ./...
 ```
 
+## 使用说明
+
+从零到连通的完整流程。两种用法:本机用 **stdio**(无需 key、最简),或多客户端用 **HTTP + 多 key**。
+
+### 快速开始(stdio,本机)
+
+```bash
+go build -o localtask-mcp .
+# Claude Code 配置(.mcp.json):
+#   {"mcpServers":{"localtask":{"command":"/abs/path/to/localtask-mcp"}}}
+```
+
+无认证(信任启动它的本地进程)、无网络、无监听 socket。本机单用户用优先这个。
+
+### 快速开始(HTTP,多客户端)
+
+1. 生成 key、写 `keys.json`(格式见下)。
+2. 起 HTTP:`./localtask-mcp -http 0.0.0.0:8011 -keys keys.json`(或加密后用 `keys.json.enc`,见 [加密](#加密-keysjsonembed-key))。
+3. 客户端连:`http://<host>:8011/mcp`,`Authorization: Bearer <key>`。
+
+```bash
+# 生成两个 key
+openssl rand -hex 32   # yuan 用
+openssl rand -hex 32   # zhao 用
+
+# 起(明文 HTTP,仅可信网络)
+./localtask-mcp -http 0.0.0.0:8011 -keys keys.json
+
+# 验证
+curl -H "Authorization: Bearer <yuan的key>" http://127.0.0.1:8011/    # 应 200
+curl -H "Authorization: Bearer wrong"      http://127.0.0.1:8011/    # 应 401
+```
+
+### keys.json 格式
+
+JSON 数组,每个对象一个 key。字段:
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `key` | 是 | 256-bit hex(用 `openssl rand -hex 32` 生成)。比对常量时间,不泄露数量/身份 |
+| `label` | 否 | 标签(如用户名),仅日志/辨识用 |
+| `revoked` | 否 | `true` 则加载时跳过(key 失效但记录保留,便于审计/恢复) |
+
+例子(两个有效 key + 一个已撤销):
+
+```json
+[
+  {"key":"4e97a5fdfd9537c60bf1d70eeeae8cd9f87830a9bd8f56ff1d5daf9f8267624c","label":"yuan"},
+  {"key":"9c6eb4d8a5ae64fbd89df4d5edf2cc27b8629720212d35c878cc003cb3652155","label":"zhao"},
+  {"key":"0047c08f15db56158bd5a941291ede1cb5f54edbc5dd5302feb59971fcc4461e","label":"node1","revoked":true}
+]
+```
+
+> 上面的 key 值是**示例占位**——别用真实 key 生成后再贴回文档。每个 key 授予**完整主机控制权**(任意 shell + 任意文件读写,以服务运行用户身份),当 root 凭据对待。
+
+**轮换 key**:编辑 `keys.json`(或加密后的 `.enc`)→ 重启服务(无热加载)。撤销直接加 `"revoked":true` + 重启,不必删条目。
+
 ## 工具
 
 | 工具 | 说明 | 参数 |
@@ -85,14 +142,7 @@ HTTP 请求须带 `Authorization: Bearer <key>`。key 启动时从以下来源�
 openssl rand -hex 32   # 每个 key 256-bit hex
 ```
 
-`keys.json` 示例(一个有效,一个撤销):
-
-```json
-[
-  {"key":"a1b2...","label":"alice"},
-  {"key":"c3d4...","label":"ci-bot","revoked":true}
-]
-```
+`keys.json` 格式与示例见 [使用说明](#keysjson-格式)。
 
 > 每个 key 授予**完整主机控制权**(任意 shell + 任意文件读写,以服务运行用户身份)。当 root 凭据对待。轮换:编辑 `keys.json` + 重启(无热加载)。
 
