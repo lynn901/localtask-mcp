@@ -1,119 +1,91 @@
 # localtask-mcp
 
-A Go MCP (Model Context Protocol) server exposing host-management capabilities —
-shell execution, file read/write, directory listing, system info, process/disk/memory
-stats, and kubectl — as MCP tools.
+Go 实现的 MCP(Model Context Protocol)服务器,把主机管理能力(shell 执行、文件读写、目录列表、系统信息、进程/磁盘/内存、kubectl)暴露为 MCP 工具。是原 `server.py`(零依赖 HTTP JSON API)的 MCP 重写,可被任何 MCP 客户端(Claude Code、Claude Desktop 等)调用。
 
-It is a Go reimplementation of the original `server.py` (a zero-dependency HTTP JSON
-API), now exposed through the standard MCP protocol so any MCP-compatible client
-(Claude Code, Claude Desktop, custom clients) can drive it.
+- **语言**:Go 1.21+(在 1.26 构建),除官方 MCP SDK 外零非测试依赖
+- **SDK**:[`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk) v1.7
+- **传输**:stdio(默认,本地客户端)+ 流式 HTTP(`-http`)
 
-- **Language**: Go 1.21+ (built on 1.26), zero non-test deps beyond the official MCP SDK
-- **SDK**: [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk) v1.7
-- **Transports**: stdio (default, for local clients) + streamable HTTP (`-http`)
-
-## Build
+## 构建
 
 ```bash
-# requires Go on PATH (see "Install Go" below if you don't have it)
 go build -o localtask-mcp .
-
-# verify
-./localtask-mcp -h
+./localtask-mcp -h   # 验证
 ```
 
-Run tests (integration test launches the server over stdio and exercises every tool):
+测试(集成测试经 stdio 启动并调用每个工具):
 
 ```bash
-go test -v -run TestTools ./...
+go test -v ./...
 ```
 
-## Tools
+## 工具
 
-| Tool         | Description                                            | Key params |
-|--------------|--------------------------------------------------------|------------|
-| `exec`       | Run a shell command via `sh -c`; returns exit/stdout/stderr | `command` (req), `timeout` (def 30) |
-| `read`       | Read a UTF-8 text file                                 | `path` (req) |
-| `write`      | Write UTF-8 text to a file (overwrites; creates dirs)  | `path` (req), `content` (req) |
-| `write_bytes`| Write binary to a file (overwrites; creates dirs)     | `path` (req), `contentHex` xor `contentBase64` |
-| `list`       | List directory contents (`type\tname\tsize` per line) | `path` (def `.`) |
-| `info`       | Host info: hostname, platform, time, user, cwd        | — |
-| `ps`         | Top 20 processes by memory, or filter by name         | `name` (optional, sanitized) |
-| `df`         | Disk usage (`df -h`)                                  | — |
-| `mem`        | Memory usage (`free -h`)                               | — |
-| `k8s`        | Run a kubectl command (def `kubectl get nodes`)      | `command` (def), `timeout` (def 30) |
-| `download`   | Read a file as base64 (binary-safe)                   | `path` (req) |
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `exec` | `sh -c` 执行,返回 exit/stdout/stderr | `command`(必填),`timeout`(默认 30) |
+| `read` | 读 UTF-8 文本文件 | `path`(必填) |
+| `write` | 写 UTF-8 文本(覆盖,自动建目录) | `path`(必填),`content`(必填) |
+| `write_bytes` | 写二进制(覆盖,自动建目录) | `path`(必填),`contentHex` 或 `contentBase64` |
+| `list` | 列目录(`类型\t名称\t大小` 每行) | `path`(默认 `.`) |
+| `info` | 主机信息:hostname/platform/time/user/cwd | — |
+| `ps` | 内存 top 20 进程,或按名过滤 | `name`(可选,白名单过滤) |
+| `df` | 磁盘占用(`df -h`) | — |
+| `mem` | 内存占用(`free -h`) | — |
+| `k8s` | kubectl(默认 `kubectl get nodes`) | `command`(默认),`timeout`(默认 30) |
+| `download` | 读文件为 base64(二进制安全) | `path`(必填) |
 
-Tool schemas (required vs optional fields) are derived from the Go struct tags:
-fields without `omitempty` are **required** and are validated by the SDK before the
-handler runs. The `ps` tool's `name` argument is whitelisted with
-`^[a-zA-Z0-9._-]+$` to prevent shell injection through `grep`.
+字段必填/可选由 Go 结构标签决定:无 `omitempty` 的字段**必填**,SDK 在 handler 前校验。`ps` 的 `name` 用 `^[a-zA-Z0-9._-]+$` 白名单,防 shell 注入。
 
-## Run
+## 运行
 
-### stdio (default — for local MCP clients)
+### stdio(默认,本地客户端)
 
 ```bash
 ./localtask-mcp
 ```
 
-Reads JSON-RPC from stdin, writes to stdout, logs to stderr. This is the mode
-MCP clients spawn automatically.
+从 stdin 读 JSON-RPC,往 stdout 写,日志到 stderr。MCP 客户端自动以此模式启动。
 
-### streamable HTTP
+### 流式 HTTP
 
-HTTP mode requires **multi-key bearer auth** (see [Authentication](#authentication))
-and optionally runs over **TLS** (see [TLS](#tls)).
+HTTP 模式需**多 key bearer 认证**(见下),可选 **TLS**。
 
 ```bash
-# plain HTTP, two keys with labels
+# 明文 HTTP,两 key 带标签
 ./localtask-mcp -http 127.0.0.1:8011 -tokens "$(openssl rand -hex 32):alice,$(openssl rand -hex 32):bob"
 
-# HTTPS with an auto-generated self-signed cert (prints fingerprint to stderr)
+# HTTPS 自签证书(启动时生成,打印 SHA-256 指纹)
 ./localtask-mcp -http 127.0.0.1:8443 -tls-selfsigned -tokens "$TOKEN:alice"
 
-# HTTPS with your own cert files (e.g. Let's Encrypt)
-./localtask-mcp -http 127.0.0.1:8443 -cert /path/fullchain.pem -key /path/privkey.pem -tokens "$TOKEN:alice"
-
-# stateless: no sessions, one-shot per request (GET/DELETE return 405)
-./localtask-mcp -http 127.0.0.1:8443 -tls-selfsigned -tokens "$TOKEN:alice" -stateless
+# HTTPS 用自己证书
+./localtask-mcp -http 127.0.0.1:8443 -cert fullchain.pem -key privkey.pem -tokens "$TOKEN:alice"
 ```
 
-MCP endpoint: `POST /mcp` (`Authorization: Bearer <key>`, `Accept: application/json, text/event-stream`).
-Health/identity: `GET /` (also requires a valid key).
+MCP 端点:`POST /mcp`(`Authorization: Bearer <key>`,`Accept: application/json, text/event-stream`)。健康/身份:`GET /`(也要有效 key)。
 
-`MaxRequestBodyBytes` is disabled (`-1`) so large file writes / command outputs are
-not rejected with HTTP 413 — appropriate for trusted local use only.
+## 认证
 
-## Authentication
+| 传输 | 认证 |
+|------|------|
+| stdio | **无** — 信任启动它的本地进程 |
+| HTTP | **多 key bearer**(必需) |
 
-| Transport | Auth |
-|-----------|------|
-| stdio     | **none** — trusts the local process that spawned it |
-| HTTP      | **multi-key bearer** (required) |
+HTTP 请求须带 `Authorization: Bearer <key>`。key 启动时从以下来源加载(后者追加,都被接受):
 
-HTTP requests must carry `Authorization: Bearer <key>`. Keys are loaded once at
-startup from any of these (later sources are appended, all are accepted):
+| 来源 | flag/环境变量 | 格式 |
+|------|------------|------|
+| 内联 | `-tokens` 或 `MCP_TOKENS` | 逗号分隔 `key` 或 `key:label` |
+| 文件 | `-keys <path>` | JSON 数组 `{"key","label"?,"revoked"?}` |
+| 兼容 | `MCP_TOKEN`(仅当无其它时) | 单个裸 token |
 
-| Source | Flag / env | Format |
-|--------|------------|--------|
-| inline | `-tokens` flag or `MCP_TOKENS` env | comma-separated `key` or `key:label` |
-| file   | `-keys <path>` | JSON array of `{"key","label"?,"revoked"?}` |
-| legacy | `MCP_TOKEN` env (only if nothing else set) | single bare token, backward compat |
-
-Comparison is constant-time (`crypto/subtle`, all keys compared every request so
-the count/identity isn't leaked by timing). Missing/invalid keys get `401` with a
-`WWW-Authenticate: Bearer` challenge. Revoked keys (`"revoked":true` in the JSON
-file) are skipped at load. If HTTP mode starts with zero active keys, it refuses
-(exit 2).
-
-Generate strong keys:
+比对常量时间(`crypto/subtle`,每请求比所有 key,不泄露数量/身份)。缺失/无效→`401` 带 `WWW-Authenticate: Bearer`。撤销 key(`"revoked":true`)加载时跳过。HTTP 模式启动时若零有效 key → 拒启(exit 2)。
 
 ```bash
-openssl rand -hex 32   # 256-bit hex secret per key
+openssl rand -hex 32   # 每个 key 256-bit hex
 ```
 
-`keys.json` example (one valid, one revoked):
+`keys.json` 示例(一个有效,一个撤销):
 
 ```json
 [
@@ -122,99 +94,66 @@ openssl rand -hex 32   # 256-bit hex secret per key
 ]
 ```
 
-> Each key grants **full host control** (arbitrary shell + any file R/W as the
-> server's OS user). Treat keys like root credentials. To rotate a key, edit
-> `keys.json` and restart (no hot reload).
+> 每个 key 授予**完整主机控制权**(任意 shell + 任意文件读写,以服务运行用户身份)。当 root 凭据对待。轮换:编辑 `keys.json` + 重启(无热加载)。
 
-## Encrypting keys.json (embedded key)
+## 加密 keys.json(embed key)
 
-To avoid leaving bearer keys in a plaintext file, you can encrypt `keys.json`
-with **AES-256-GCM**, where the decryption key is baked into the binary at build
-time (not on disk, not in an env var). **The plaintext source is deleted once
-the ciphertext is verified to round-trip** — keep your own backup of
-`keys.json` elsewhere before encrypting.
+为避免明文 bearer key 留在文件里,可用 **AES-256-GCM** 加密 `keys.json`,解密密钥在构建时烧入二进制(不在磁盘、不在环境变量)。**密文经解密验证能还原原文后,明文源文件即被删除**——加密前先自己备份 `keys.json`。
 
-**Threat model & limits.** This protects against the keys file being read by
-anyone who has **the file but not the binary** — e.g. backups, snapshots, git
-leaks, or another same-user process that reads the file. It does **not** protect
-against someone who has **both the binary and the file** (the embed key can be
-extracted from the binary with `strings`/disassembly), nor against root/runtime
-memory dumps. For a stronger model, use a TLS-terminating reverse proxy + short
-keys from a secrets manager instead.
+**威胁模型与局限**:只防"拿到文件但没拿到二进制"(备份/git 泄露/同用户进程读文件);**不防**拿到二进制+文件(embedKey 可被 `strings`/反汇编提取),也不防 root/内存转储。更强模型请用 TLS 反代 + 密钥管理服务。
 
-### Setup (three steps)
+### 三步配置
 
 ```bash
-# 1. Build the binary WITH the embed key injected via -ldflags.
-EK="$(openssl rand -hex 32)"   # 64 hex chars = 32 bytes for AES-256
-echo "embedKey=$EK (keep this for rebuilding)"  # not stored anywhere else
+# 1. 带 embedKey 编译二进制
+EK="$(openssl rand -hex 32)"   # 64 hex = 32 字节 AES-256
+echo "embedKey=$EK(留着重编译用)"  # 不存任何地方
 go build -ldflags "-X main.embedKey=$EK" -o localtask-mcp .
 
-# 2. Encrypt keys.json → keys.json.enc (the plaintext source is then DELETED).
-#    Keep your own backup of keys.json first — this directory will hold no
-#    plaintext after this step.
+# 2. 加密 keys.json → keys.json.enc(明文源随后被删)
 ./localtask-mcp -encrypt-keys keys.json keys.json.enc
 
-# 3. Run the server; -keys transparently decrypts using the baked-in key.
+# 3. 运行;-keys 用烧入的 key 透明解密
 ./localtask-mcp -http 127.0.0.1:8443 -tls-selfsigned -keys keys.json.enc
 ```
 
-`-encrypt-keys` forms:
-- `./localtask-mcp -encrypt-keys <in>` — encrypts `<in>` **in place** (overwrites with ciphertext). The path is kept (now ciphertext), not removed.
-- `./localtask-mcp -encrypt-keys <in> <out>` — reads plaintext `<in>`, writes ciphertext `<out>`, then **deletes** `<in>` after verifying `<out>` round-trips. This is the form for a systemd deployment (edit `keys.json`, produce `keys.json.enc`, the plaintext is consumed).
-- `-keep` — in the two-arg form, do **not** delete `<in>` (use it to refresh `<out>` from a master `keys.json` you keep elsewhere).
-- Re-encrypting an already-encrypted file is refused.
-- The written ciphertext is decrypted back and compared to the original before the plaintext is removed, so a source is never deleted in favor of an undecryptable file.
+`-encrypt-keys` 形式:
+- `-encrypt-keys <in>` — **原地**加密(路径不变,内容变密文)
+- `-encrypt-keys <in> <out>` — 读 `<in>` 写 `<out>`,验证 `<out>` 能解密还原后**删除** `<in>`
+- `-keep` — 双参数时不删 `<in>`(从自己保留的 master keys.json 刷新密文用)
+- 对已加密文件再加密会被拒
 
-If you rebuild without `-ldflags` (no embed key), the server refuses to decrypt
-an encrypted file and exits. A different embed key fails the GCM tag check
-(=decryption error).
+无 embedKey 编译的二进制拒绝解密/拒绝加密;embedKey 不同则 GCM tag 校验失败(=解密错误)。
 
-### Rotating bearer keys (without changing the embed key)
+### 轮换 key(不改 embedKey)
 
 ```bash
-# Edit your own plaintext copy of keys.json, then re-encrypt to keys.json.enc:
-./localtask-mcp -encrypt-keys keys.json keys.json.enc
-# Restart the server (e.g. systemctl --user restart localtask-mcp).
+./localtask-mcp -encrypt-keys keys.json keys.json.enc   # 用自存明文副本,明文被删
+systemctl --user restart localtask-mcp
 ```
 
-### Changing the embed key
+### 换 embedKey
 
 ```bash
 EK2="$(openssl rand -hex 32)"
 go build -ldflags "-X main.embedKey=$EK2" -o localtask-mcp .
-# Re-encrypt every keys file with the NEW binary:
-./localtask-mcp -encrypt-keys keys.json keys.json.enc
+./localtask-mcp -encrypt-keys keys.json keys.json.enc   # 用新二进制重加密
 ```
 
-### If the server can't decrypt at startup
+## systemd 部署(HTTP,无 TLS,加密 key)
 
-When `-keys` points to a missing or undecryptable file, the server prints an error
-and exits non-zero. Under systemd (`Restart=on-failure`) it will keep restarting
-and failing until you provide a valid encrypted keys file — no service is exposed
-in that state.
-
-## Deployment with systemd (HTTP, no TLS, encrypted keys)
-
-A user-level systemd unit runs the server on loopback HTTP, loading keys from the
-encrypted `keys.json.enc`. No sudo needed.
-
-The unit file lives **in this project** (`localtask-mcp.service`) and is the
-single source of truth — the deployed copy is a **symlink** to it, so editing
-the file here and running `daemon-reload` is all you ever do.
-
-`localtask-mcp.service` (in the project root):
+user 级单元跑在回环 HTTP,从加密 `keys.json.enc` 加载。无需 sudo。unit 文件**在项目内**(`localtask-mcp.service`,单一来源),部署处用**符号链接**指向它,编辑项目文件 + `daemon-reload` 即可生效。
 
 ```ini
 [Unit]
-Description=localtask MCP server (HTTP, no TLS, encrypted keys)
+Description=localtask MCP server (HTTP, multi-key bearer, optional TLS)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/yuan/localtask
-ExecStart=/home/yuan/localtask/localtask-mcp -http 127.0.0.1:8011 -keys /home/yuan/localtask/keys.json.enc
+WorkingDirectory=%h/localtask
+ExecStart=%h/localtask/localtask-mcp -http 0.0.0.0:8011 -keys %h/localtask/keys.json.enc
 Restart=on-failure
 RestartSec=3s
 
@@ -222,208 +161,126 @@ RestartSec=3s
 WantedBy=default.target
 ```
 
-Install and run (the symlink keeps the project file as the source of truth):
+`%h` = user 实例所属用户的家目录,故可跨主机/用户移植。
 
 ```bash
 mkdir -p ~/.config/systemd/user
-ln -sf "$PWD/localtask-mcp.service" ~/.config/systemd/user/localtask-mcp.service
+ln -sf "$HOME/localtask/localtask-mcp.service" ~/.config/systemd/user/localtask-mcp.service
 systemctl --user daemon-reload
 systemctl --user enable --now localtask-mcp
-systemctl --user status localtask-mcp          # see "active (running)"
-journalctl --user -u localtask-mcp -f           # follow logs
+systemctl --user status localtask-mcp
+journalctl --user -u localtask-mcp -f
 ```
 
-To change the unit, edit `localtask-mcp.service` in the project, then
-`systemctl --user daemon-reload && systemctl --user restart localtask-mcp` —
-the symlink means the deployed copy tracks the project file automatically.
+注意:
+- 二进制必须带 embedKey 编译过;否则解不开 `keys.json.enc`,服务起不来。
+- 未登录也跑(开机自启)需 `loginctl enable-linger $USER`(可能需权限)。
+- 监听 `0.0.0.0` + 无 TLS:key 在链路明文,仅可信网络用;不可信网络要加 TLS。
 
-Workflow for key changes (the embed key is already baked into the binary):
+## RPM 打包(RHEL 系,服务器部署)
 
-```bash
-# edit your own plaintext keys.json copy, then:
-./localtask-mcp -encrypt-keys keys.json keys.json.enc   # plaintext source is consumed (deleted)
-systemctl --user restart localtask-mcp
-```
-
-Notes:
-- The binary must have been built with the embed key (`-ldflags "-X main.embedKey=..."`); a plain build can't decrypt `keys.json.enc` and the service will fail to start.
-- To run the service while you're not logged in (e.g. at boot), enable lingering: `loginctl enable-linger $USER` (may need admin rights on some systems).
-- A hardened variant adds `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=/home/yuan/localtask` — but since the server legitimately runs shell commands and writes files anywhere, do not sandbox the filesystem more broadly (it would break the exec/write tools).
-
-## RPM packages (RHEL-family Linux, server deployment)
-
-For deploying to a RHEL/CentOS/Fedora/Rocky/Alma server, build RPMs with
-[nfpm](https://github.com/goreleaser/nfpm). The packaged binary has a **fixed
-embed key baked in** (via `-ldflags`); every host installing the RPM shares that
-embed key, while each host keeps its own `keys.json.enc` (encrypted with that
-key) in `/etc/localtask`. The RPM installs a **system-level** systemd unit
-(`/usr/lib/systemd/system/localtask-mcp.service`) so the service starts at boot
-without a logged-in user (no `loginctl enable-linger` needed).
-
-Build (from the repo root; needs `go` and `nfpm` on PATH):
+用 [nfpm](https://github.com/goreleaser/nfpm) 打 x86_64 + aarch64 RPM。包内二进制带**固定 embedKey**(经 `-ldflags` 烧入);装这个包的所有主机共享该 embedKey,各自在 `/etc/localtask` 放自己的 `keys.json.enc`(用同 embedKey 加密)。RPM 装 **system 级** unit(`/usr/lib/systemd/system/`),开机自启,不依赖登录。
 
 ```bash
-# EMBED_KEY must match the one you (will) encrypt keys.json.enc with.
-# 64 hex chars = 32 bytes for AES-256.
-EMBED_KEY=<your-embed-key> ./packaging/build-rpm.sh
+# EMBED_KEY 须与加密 keys.json.enc 用的一致(64 hex)
+EMBED_KEY=<你的-embed-key> ./packaging/build-rpm.sh
 # → dist/localtask-mcp-<ver>-1.x86_64.rpm
 #   dist/localtask-mcp-<ver>-1.aarch64.rpm
 ```
 
-Install on a target host:
+目标机安装:
 
 ```bash
-sudo rpm -ivh dist/localtask-mcp-<ver>-1.<arch>.rpm
-# rpm prints the post-install message with the keys setup steps (below).
+sudo rpm -ivh --nosignature dist/localtask-mcp-<ver>-1.<arch>.rpm   # 内部自打包无签名,--nosignature 跳过
 
-# 1) Create bearer keys (each grants FULL host control) — keys travel in
-#    cleartext over plain HTTP, so only bind 0.0.0.0 on a trusted network,
-#    or add TLS.
-echo -n '[{"key":"'$(openssl rand -hex 32)'","label":"alice"}]' | \
-  sudo tee /etc/localtask/keys.json >/dev/null
+# 1) 建 key(每个 = 完整主机控制权)
+echo -n '[{"key":"'$(openssl rand -hex 32)'","label":"alice"}]' | sudo tee /etc/localtask/keys.json
 sudo chmod 640 /etc/localtask/keys.json
 
-# 2) Encrypt with the package binary (embed key is baked in). The plaintext
-#    source is deleted after the ciphertext is verified to round-trip.
+# 2) 用包内二进制加密(embedKey 已烧入,明文源随后被删)
 sudo /usr/local/bin/localtask-mcp -encrypt-keys /etc/localtask/keys.json /etc/localtask/keys.json.enc
 
-# 3) (Optional) tune listen addr/port/TLS in the installed unit:
-#       sudo vi /usr/lib/systemd/system/localtask-mcp.service
-#    Defaults: bind 0.0.0.0:8011, plain HTTP.
-
-# 4) Enable + start:
+# 3) 起
 sudo systemctl daemon-reload
 sudo systemctl enable --now localtask-mcp
 sudo journalctl -u localtask-mcp -f
 
-# 5) RHEL firewall (if bound off-loopback):
+# 4) RHEL 防火墙
 sudo firewall-cmd --permanent --add-port=8011/tcp && sudo firewall-cmd --reload
 ```
 
-SELinux: the service runs shell commands and writes files anywhere as its user
-(root by default), which enforcing SELinux may flag. If it fails to start, check
-AVC denials with `sudo ausearch -m AVC -ts recent` and generate a policy with
-`audit2allow` — do **not** blanket-disable SELinux with `setenforce 0`.
-
-To remove: `sudo rpm -e localtask-mcp` (the pre-remove script stops+disables the
-service). Config under `/etc/localtask` (incl. `keys.json.enc`) is kept — remove
-manually if desired.
+SELinux:服务以 root 跑任意 shell + 任意写,enforcing 可能拦 AVC。起不来查 `sudo ausearch -m AVC -ts recent`,用 `audit2allow` 生成策略,**不要** `setenforce 0`。卸载:`sudo rpm -e localtask-mcp`(pre-remove 停+disable 服务);`/etc/localtask` 配置保留,需手动删。
 
 ## TLS
 
-HTTPS is available two ways:
+两种:
+1. **自签(自动生成)**:`-tls-selfsigned`,启动时生成 ECDSA(P-256)自签证书(1 年有效,localhost+127.0.0.1),往 stderr 打 **SHA-256 指纹**,客户端 pin 该指纹。适合本地/可信内网。
+2. **自己证书**:`-cert <pem>` + `-key <pem>`(如 Let's Encrypt)。有真域名 + CA 证书用这个。
 
-**1. Self-signed (auto-generated).** Pass `-tls-selfsigned`. The server generates
-a fresh ECDSA (P-256) self-signed certificate valid for 1 year (for `localhost`
-and `127.0.0.1`) and prints its **SHA-256 fingerprint** to stderr:
+无 `-tls-selfsigned`/`-cert`/`-key` → 明文 HTTP。最低 TLS 1.2。
 
+> 注意:Claude Code 默认严格校验 TLS,**不支持指纹 pin**,只支持 `NODE_EXTRA_CA_CERTS=<pem>` 追加信任。`-tls-selfsigned` 证书只在内存、每次启动换新,故 Claude Code 连不上;要用 HTTPS 接 Claude Code 需固定 PEM(`-cert/-key`)+ `NODE_EXTRA_CA_CERTS` 指向它。
+
+## 客户端配置
+
+### Claude Code
+
+stdio(本地主机管理,无需 key):
+
+```json
+{"mcpServers":{"localtask":{"command":"/abs/path/to/localtask-mcp"}}}
 ```
-localtask-mcp: TLS self-signed cert SHA-256 fingerprint:
-  3a7650c9002c3ccd0ab00afc0d00452b10fbfc8c1f1e6f593caa30cb36b1e4d1
-```
 
-Pin that fingerprint in your client (skip CA verification and compare the cert
-fingerprint). Best for local / trusted-LAN use where you don't have a domain.
-
-**2. Your own cert files.** Pass `-cert <pem>` and `-key <pem>` (e.g. a Let's
-Encrypt fullchain/privkey). Use this when you have a real domain + CA-issued cert.
-
-No `-tls-selfsigned`, `-cert`, or `-key` → plain HTTP. Min TLS version is 1.2.
-
-## Client configuration
-
-### Claude Code (`~/.claude.json` / project `.mcp.json`)
-
-stdio (recommended for local host management — no token needed):
+流式 HTTP(key 作 header):
 
 ```json
 {
   "mcpServers": {
     "localtask": {
-      "command": "/abs/path/to/localtask-mcp"
+      "url": "http://127.0.0.1:8011/mcp",
+      "headers": {"Authorization": "Bearer <your-key>"}
     }
   }
 }
 ```
 
-streamable HTTP (key passed as a header). Works for plain HTTP or HTTPS:
-
-```json
-{
-  "mcpServers": {
-    "localtask": {
-      "url": "https://127.0.0.1:8443/mcp",
-      "headers": {
-        "Authorization": "Bearer <your-key>"
-      }
-    }
-  }
-}
-```
-
-> For self-signed certs, configure your client to skip CA verification and pin
-> the SHA-256 fingerprint printed at startup. The exact mechanism depends on the
-> client (e.g. env var, a `tls`/`--insecure` option, or a custom CA bundle
-> containing the printed cert).
-
-Or via CLI:
+或 CLI:
 
 ```bash
-# stdio (no key)
-claude mcp add localtask /abs/path/to/localtask-mcp
-
-# HTTPS with a bearer key
-claude mcp add --transport http localtask https://127.0.0.1:8443/mcp \
-  --header "Authorization: Bearer <your-key>"
+claude mcp add localtask /abs/path/to/localtask-mcp                       # stdio
+claude mcp add --transport http localtask http://127.0.0.1:8011/mcp \
+  --header "Authorization: Bearer <your-key>"                               # HTTP
 ```
 
-### Mapping from the old `server.py`
+### 与 server.py 的映射
 
-| `server.py` action | MCP tool     | Notes |
-|--------------------|--------------|-------|
-| `exec`             | `exec`       | same semantics, `sh -c` + timeout |
-| `read`             | `read`       | UTF-8 only; binary → use `download` |
-| `write`            | `write`      | now creates parent dirs |
-| `PUT /upload`      | `write_bytes`| binary upload via hex/base64 (PUT raw body isn't an MCP concept) |
-| `list`             | `list`       | tab-separated output |
-| `info`             | `info`       | platform is now `os/arch` |
-| `ps`               | `ps`         | same name whitelist |
-| `df` / `mem`       | `df` / `mem` | identical |
-| `k8s`              | `k8s`        | same default + timeout |
-| — (new)            | `download`   | binary-safe read as base64 |
+| server.py action | MCP 工具 | 说明 |
+|---|---|---|
+| exec | `exec` | 同语义,`sh -c` + timeout |
+| read | `read` | UTF-8;二进制用 `download` |
+| write | `write` | 现在自动建父目录 |
+| PUT /upload | `write_bytes` | hex/base64 上传 |
+| list | `list` | tab 分隔输出 |
+| info | `info` | platform 现为 `os/arch` |
+| ps | `ps` | 同名白名单 |
+| df/mem | `df`/`mem` | 相同 |
+| k8s | `k8s` | 同默认+timeout |
+| — | `download` | 二进制安全读为 base64 |
 
-## Security
+## 安全
 
-This server runs **arbitrary shell commands** and reads/writes **any file** reachable
-by its OS user. It is intended for trusted local/single-user use (a personal
-automation bridge between an MCP client and your host).
+服务以 OS 用户身份运行**任意 shell**、读写**任意可达文件**。专为可信本地/单用户场景(个人自动化桥接)。每个 key = 完整主机控制权,当 root 凭据对待。
 
-- **HTTP transport** is multi-key bearer authenticated ([Authentication](#authentication))
-  and can run over **TLS** ([TLS](#tls)) — an improvement over the original
-  `server.py`, which had no auth and no TLS. Prefer `-tls-selfsigned` (or your own
-  cert) so the bearer key isn't sent in cleartext. Still: bind to loopback
-  (`-http 127.0.0.1:…`) on shared hosts, and never expose `-http 0.0.0.0:…` to an
-  untrusted network without transport-level protection in front.
-- **stdio transport** is unauthenticated by design (it trusts the local process
-  that spawned it). Prefer it for local use — no listening socket at all.
-- Each key grants full host control; treat keys like root credentials. Rotate by
-  editing `keys.json` and restarting.
-- The SDK also applies DNS-rebinding / cross-origin protection by default
-  (`DisableLocalhostProtection` is left on).
+- **HTTP**:多 key bearer + 可选 TLS,比原 server.py(无认证无 TLS)强。优先 loopback(`127.0.0.1`);`0.0.0.0` 仅在可信网络 + 配 TLS。
+- **stdio**:无认证(信任启动进程)。本地用优先这个,无监听 socket。
+- SDK 默认开 DNS-rebinding / 跨源保护(`DisableLocalhostProtection` 保留开)。
 
-## Install Go (if needed)
+## 安装 Go(若无)
 
 ```bash
-# official toolchain to ~/.local/go (user-space, no sudo)
-VER=1.26.6  # or latest from https://go.dev/dl
+VER=1.26.6  # https://go.dev/dl 最新版
 curl -fsSL -o /tmp/go.tar.gz "https://go.dev/dl/go$VER.linux-amd64.tar.gz"
 mkdir -p ~/.local && tar -C ~/.local -xzf /tmp/go.tar.gz
 export PATH="$HOME/.local/go/bin:$PATH"
 go version
-```
-
-Optionally add to your shell profile:
-```bash
-export PATH="$HOME/.local/go/bin:$HOME/go/bin:$PATH"
-export GOPROXY="https://goproxy.cn,https://proxy.golang.org,direct"  # use a mirror near you
 ```
