@@ -33,6 +33,12 @@ Type=simple
 # that user can read /etc/localtask and write wherever the tools need to.
 # User=localtask
 WorkingDirectory=/etc/localtask
+# systemd does not set HOME for services by default, so kubectl's default
+# kubeconfig discovery ($HOME/.kube/config) fails and it falls back to
+# localhost:8080 (the in-cluster proxy). Point KUBECONFIG at the host's kubelet
+# credentials so the k8s tool works without a per-shell export. Prefer this over
+# Environment=HOME=/root so only kubectl is affected, not other HOME-based paths.
+Environment=KUBECONFIG=/root/.kube/config
 ExecStart=/usr/local/bin/localtask-mcp \
   -http 0.0.0.0:8011 \
   -keys /etc/localtask/keys.json.enc
