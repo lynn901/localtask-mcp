@@ -11,6 +11,7 @@ keys.json.PLAINTEXT-ARCHIVE
 # committing it would leak the AES key (extractable with `strings`). Build
 # artifacts and cross-compiled outputs belong to the build step, not the repo.
 /localtask-mcp
+/localtask-mcp-*
 /dist/
 
 # Editor/OS cruft

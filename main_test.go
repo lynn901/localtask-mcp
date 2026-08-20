@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -69,7 +72,7 @@ func TestTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	want := []string{"exec", "read", "write", "write_bytes", "list", "info", "ps", "df", "mem", "k8s", "download"}
+	want := []string{"exec", "read", "write", "write_bytes", "read_bytes", "list", "info", "ps", "df", "mem", "k8s"}
 	got := map[string]bool{}
 	for _, tl := range tools.Tools {
 		got[tl.Name] = true
@@ -100,19 +103,21 @@ func TestTools(t *testing.T) {
 		t.Errorf("read roundtrip: %q", out)
 	}
 
-	// Binary write + download roundtrip.
+	// Binary write + read_bytes roundtrip. read_bytes returns base64 over the
+	// text channel, so it must survive bytes that read (raw text) cannot, such
+	// as NUL and invalid-UTF-8 bytes present in `raw` below.
 	bin := t.TempDir() + "/bin.dat"
 	raw := []byte{0, 1, 2, 255, 0, 128}
 	if out := call(t, ctx, s, "write_bytes", map[string]any{"path": bin, "contentHex": "000102ff0080"}); !strings.Contains(out, "wrote") {
 		t.Fatalf("write_bytes: %q", out)
 	}
-	b64 := call(t, ctx, s, "download", map[string]any{"path": bin})
-	dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	b64rb := call(t, ctx, s, "read_bytes", map[string]any{"path": bin})
+	decr, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64rb))
 	if err != nil {
-		t.Fatalf("download decode: %v (raw %q)", err, b64)
+		t.Fatalf("read_bytes decode: %v (raw %q)", err, b64rb)
 	}
-	if string(dec) != string(raw) {
-		t.Errorf("download roundtrip mismatch: got %v want %v", dec, raw)
+	if string(decr) != string(raw) {
+		t.Errorf("read_bytes roundtrip mismatch: got %v want %v", decr, raw)
 	}
 
 	// exec.
@@ -465,4 +470,164 @@ func TestEncryptKeysFilesDelete(t *testing.T) {
 			t.Errorf("in-place file is not ciphertext")
 		}
 	})
+}
+
+// TestHTTPFileTransfer covers the streaming /download and /upload endpoints:
+// whole-file upload roundtrip (binary-safe + sha256), chunked resume upload
+// (206/206→200, HEAD X-Received), download Range resume, checksum mismatch,
+// and bearer auth. All via httpTestServer (HTTP form, -tokens auth).
+func TestHTTPFileTransfer(t *testing.T) {
+	base, client := httpTestServer(t, "-tokens", "k:alice")
+	const auth = "Bearer k"
+
+	// A payload with bytes that the read (text) path corrupts: NUL and invalid
+	// UTF-8 (0xff 0xfe), plus a trailing newline.
+	payload := []byte{0x48, 0x69, 0xff, 0xfe, 0xe4, 0xbd, 0xad, 0x00, 0x0a}
+	wantSHA := sha256.Sum256(payload)
+	wantSHAHex := fmt.Sprintf("%x", wantSHA[:])
+
+	doReq := func(method, url string, body io.Reader, hdr map[string]string) (*http.Response, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			t.Fatalf("newreq %s %s: %v", method, url, err)
+		}
+		req.Header.Set("Authorization", auth)
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("do %s %s: %v", method, url, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, b
+	}
+
+	t.Run("auth_required", func(t *testing.T) {
+		// No bearer → 401.
+		req, _ := http.NewRequest("GET", base+"download?path=/etc/hosts", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("no-auth download: got %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("upload_whole_then_download", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "whole.bin")
+		// Single-shot upload: Content-Range bytes 0-(n-1)/n.
+		cr := fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload))
+		resp, body := doReq("PUT", base+"upload?path="+urlPath(dst), bytes.NewReader(payload), map[string]string{
+			"Content-Range":     cr,
+			"X-Expected-Sha256": wantSHAHex,
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("upload: got %d %s, want 200", resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), wantSHAHex) {
+			t.Errorf("upload body missing sha256: %s", body)
+		}
+		// After a completed upload the temp file is renamed into place, so
+		// HEAD /download (not /upload) reports the final size + sha256.
+		resp, _ = doReq("HEAD", base+"download?path="+urlPath(dst), nil, nil)
+		if got := resp.Header.Get("X-File-Size"); got != strconv.Itoa(len(payload)) {
+			t.Errorf("HEAD download X-File-Size=%q, want %d", got, len(payload))
+		}
+		if got := resp.Header.Get("X-File-Sha256"); got != wantSHAHex {
+			t.Errorf("HEAD download sha256=%q, want %s", got, wantSHAHex)
+		}
+		// GET /download returns the exact bytes.
+		resp, body = doReq("GET", base+"download?path="+urlPath(dst), nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("download: got %d, want 200", resp.StatusCode)
+		}
+		if !bytes.Equal(body, payload) {
+			t.Errorf("download roundtrip mismatch: got %x, want %x", body, payload)
+		}
+	})
+
+	t.Run("upload_chunked_resume", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "chunked.bin")
+		// First half → 206.
+		mid := len(payload) / 2
+		resp, body := doReq("PUT", base+"upload?path="+urlPath(dst), bytes.NewReader(payload[:mid]), map[string]string{
+			"Content-Range": fmt.Sprintf("bytes 0-%d/%d", mid-1, len(payload)),
+		})
+		if resp.StatusCode != http.StatusPartialContent {
+			t.Fatalf("chunk1: got %d %s, want 206", resp.StatusCode, body)
+		}
+		// HEAD shows received so far.
+		resp, _ = doReq("HEAD", base+"upload?path="+urlPath(dst), nil, nil)
+		if got := resp.Header.Get("X-Received"); got != strconv.Itoa(mid) {
+			t.Errorf("HEAD after chunk1 X-Received=%q, want %d", got, mid)
+		}
+		// Second half (final) → 200 + sha256.
+		resp, body = doReq("PUT", base+"upload?path="+urlPath(dst), bytes.NewReader(payload[mid:]), map[string]string{
+			"Content-Range":      fmt.Sprintf("bytes %d-%d/%d", mid, len(payload)-1, len(payload)),
+			"X-Expected-Sha256":  wantSHAHex,
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("chunk2: got %d %s, want 200", resp.StatusCode, body)
+		}
+		// Verify assembled file on disk matches.
+		got, err := os.ReadFile(dst)
+		if err != nil {
+			t.Fatalf("read dst: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Errorf("assembled mismatch: got %x, want %x", got, payload)
+		}
+	})
+
+	t.Run("download_range_resume", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "range.bin")
+		// Seed via upload.
+		_, _ = doReq("PUT", base+"upload?path="+urlPath(dst), bytes.NewReader(payload), map[string]string{
+			"Content-Range": fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)),
+		})
+		// Range: bytes=2- → suffix from offset 2.
+		resp, body := doReq("GET", base+"download?path="+urlPath(dst), nil, map[string]string{
+			"Range": "bytes=2-",
+		})
+		if resp.StatusCode != http.StatusPartialContent {
+			t.Fatalf("range: got %d, want 206", resp.StatusCode)
+		}
+		if !bytes.Equal(body, payload[2:]) {
+			t.Errorf("range mismatch: got %x, want %x", body, payload[2:])
+		}
+	})
+
+	t.Run("upload_checksum_mismatch", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "bad.bin")
+		resp, body := doReq("PUT", base+"upload?path="+urlPath(dst), bytes.NewReader(payload), map[string]string{
+			"Content-Range":      fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)),
+			"X-Expected-Sha256":  "deadbeef" + strings.Repeat("0", 56), // wrong
+		})
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("mismatch: got %d %s, want 500", resp.StatusCode, body)
+		}
+		// Temp file should be cleaned up: target must not exist.
+		if _, err := os.Stat(dst); !os.IsNotExist(err) {
+			t.Errorf("target should not exist after mismatch: %v", err)
+		}
+	})
+}
+
+// urlPath percent-encodes a path for use in a query string.
+func urlPath(p string) string {
+	var b strings.Builder
+	for _, c := range []byte(p) {
+		switch {
+		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '.' || c == '_' || c == '-':
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }

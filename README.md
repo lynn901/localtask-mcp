@@ -84,15 +84,17 @@ JSON 数组,每个对象一个 key。字段:
 | `read` | 读 UTF-8 文本文件 | `path`(必填) |
 | `write` | 写 UTF-8 文本(覆盖,自动建目录) | `path`(必填),`content`(必填) |
 | `write_bytes` | 写二进制(覆盖,自动建目录) | `path`(必填),`contentHex` 或 `contentBase64` |
+| `read_bytes` | 读文件为 base64(二进制安全,与 `write_bytes` 配对) | `path`(必填) |
 | `list` | 列目录(`类型\t名称\t大小` 每行) | `path`(默认 `.`) |
 | `info` | 主机信息:hostname/platform/time/user/cwd | — |
 | `ps` | 内存 top 20 进程,或按名过滤 | `name`(可选,白名单过滤) |
 | `df` | 磁盘占用(`df -h`) | — |
 | `mem` | 内存占用(`free -h`) | — |
 | `k8s` | kubectl(默认 `kubectl get nodes`) | `command`(默认),`timeout`(默认 30) |
-| `download` | 读文件为 base64(二进制安全) | `path`(必填) |
 
 字段必填/可选由 Go 结构标签决定:无 `omitempty` 的字段**必填**,SDK 在 handler 前校验。`ps` 的 `name` 用 `^[a-zA-Z0-9._-]+$` 白名单,防 shell 注入。
+
+**文本 vs 二进制通道:** `read`/`write` 走 MCP 文本通道,只能忠实往返合法 UTF-8 文本;含 NUL(`\x00`)或非法 UTF-8 字节的内容经文本通道会被损坏。二进制内容(配置、密钥、压缩文件等)请用 `read_bytes`/`write_bytes`,它们以 base64 编码传输,任意字节可逐字节往返(`read_bytes` 与 `write_bytes` 的 `contentBase64` 对称配对)。**大文件走 HTTP `/download`/`/upload` 端点(见下),流式、不进模型上下文。**
 
 ## 运行
 
@@ -120,6 +122,62 @@ HTTP 模式需**多 key bearer 认证**(见下),可选 **TLS**。
 ```
 
 MCP 端点:`POST /mcp`(`Authorization: Bearer <key>`,`Accept: application/json, text/event-stream`)。健康/身份:`GET /`(也要有效 key)。
+
+### 文件传输(HTTP:`/download`、`/upload`)
+
+> 仅 HTTP 模式可用。stdio 模式无 HTTP 端点——小文件用 MCP 工具 `read_bytes`/`write_bytes`(内容进模型上下文)。
+
+`/download`、`/upload` 提供**流式**文件上传下载,绕开模型上下文,支持 GB 级大文件、断点续传、sha256 校验。模型可用 `exec` 工具跑 `curl` 调用。所有请求带 `Authorization: Bearer <key>`,错误体统一 `application/json` `{"error","detail"}`。
+
+**下载 `GET/HEAD /download?path=<abs>`**
+
+- `GET`:标准 HTTP Range(断点续传、多段),`206` + `Content-Range`,`200` 全量。
+- `HEAD`:返回 `X-File-Size`、`X-File-Sha256`(全文件,流式计算)、`ETag`(sha256)、`Accept-Ranges: bytes`。
+
+```bash
+KEY=...; BASE=http://127.0.0.1:8011
+# 全量下载
+curl -f -H "Authorization: Bearer $KEY" -o /tmp/big.tar "$BASE/download?path=/data/big.tar"
+# 断点续传(中断后接着下)
+curl -f -C - -H "Authorization: Bearer $KEY" -o /tmp/big.tar "$BASE/download?path=/data/big.tar"
+# 分片拉取
+curl -f -H "Authorization: Bearer $KEY" -H "Range: bytes=0-4194303" "$BASE/download?path=/data/big.tar" -o part0
+# 校验:拉前/拉后取 sha256 核对
+curl -fsS -I -H "Authorization: Bearer $KEY" "$BASE/download?path=/data/big.tar" | grep -i X-File-Sha256
+```
+
+**上传 `PUT/HEAD /upload?path=<abs>[&mode=<octal>]`**
+
+分片续传协议(无会话状态,幂等拼接):每次 `PUT` 带 `Content-Range: bytes <start>-<end>/<total>`,body 是该切片;写临时文件 `<path>.ltmp`,末片(`end+1==total`)时全文件算 sha256,通过则原子 `rename` 到目标。
+
+- 非末片:`206` `{"received":N,"total":T}`,临时文件保留。
+- 末片:`200` `{"path","sha256","size"}`;带 `X-Expected-Sha256` 请求头则 server 比对,不符 `500` 并删临时文件。
+- `HEAD /upload?path=<abs>`:返回 `X-Received`(临时文件当前长度),用于续传定位。
+
+```bash
+KEY=...; BASE=http://127.0.0.1:8011; FILE=/data/big.tar
+# 整文件上传(一次)
+SIZE=$(stat -c%s "$FILE"); END=$((SIZE-1))
+curl -f -H "Authorization: Bearer $KEY" \
+  -H "Content-Range: bytes 0-$END/$SIZE" \
+  -H "X-Expected-Sha256: $(sha256sum "$FILE" | cut -d' ' -f1)" \
+  --data-binary @"$FILE" "$BASE/upload?path=$FILE"
+
+# 分片续传(每片 4MiB);中断后从 HEAD 查到的 offset 续
+CHUNK=4194304
+for off in $(seq 0 $CHUNK $((SIZE-1))); do
+  end=$((off+CHUNK-1)); [ $end -ge $SIZE ] && end=$((SIZE-1))
+  dd if="$FILE" bs=1 skip=$off count=$((end-off+1)) 2>/dev/null | \
+  curl -f -H "Authorization: Bearer $KEY" \
+    -H "Content-Range: bytes $off-$end/$SIZE" \
+    --data-binary @- "$BASE/upload?path=$FILE"
+done
+# 续传定位(中断后接着传)
+RCV=$(curl -fsS -I -H "Authorization: Bearer $KEY" "$BASE/upload?path=$FILE" | grep -i X-Received | tr -dc '0-9')
+echo "server already has $RCV bytes"
+```
+
+**小文件 vs 大文件:** 走 MCP 工具(`read_bytes`/`write_bytes`)省事但内容进模型上下文,仅适合 <~1 MiB;走 HTTP 端点流式、不占上下文,适合大文件。
 
 ## 认证
 

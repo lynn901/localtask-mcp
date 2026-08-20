@@ -43,7 +43,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -106,6 +108,10 @@ type ListInput struct {
 	Path string `json:"path,omitempty" jsonschema:"Directory to list. Defaults to the current working directory."`
 }
 
+type ReadBytesInput struct {
+	Path string `json:"path" jsonschema:"Absolute or relative path of the file to read (binary-safe, returned as base64)"`
+}
+
 type PSInput struct {
 	Name string `json:"name,omitempty" jsonschema:"Filter processes by name (alphanumeric, dash, underscore, dot only). If omitted, lists top 20 by memory."`
 }
@@ -113,10 +119,6 @@ type PSInput struct {
 type K8sInput struct {
 	Command string `json:"command,omitempty" jsonschema:"kubectl command to run. Defaults to kubectl get nodes."`
 	Timeout int    `json:"timeout,omitempty" jsonschema:"Max seconds before the command is killed. Defaults to 30."`
-}
-
-type DownloadInput struct {
-	Path string `json:"path" jsonschema:"Path of the file to download as base64."`
 }
 
 // ----- Handlers ------------------------------------------------------------
@@ -320,7 +322,11 @@ func handleK8s(ctx context.Context, _ *mcp.CallToolRequest, in K8sInput) (*mcp.C
 	return textResult(fmt.Sprintf("exit: %d\n--- stdout ---\n%s\n--- stderr ---\n%s", rc, stdout.String(), stderr.String()))
 }
 
-func handleDownload(_ context.Context, _ *mcp.CallToolRequest, in DownloadInput) (*mcp.CallToolResult, any, error) {
+// handleReadBytes is the binary-safe counterpart to read: it returns the raw
+// file bytes base64-encoded, so NUL and non-UTF-8 bytes survive the MCP text
+// channel round-trip that read's plain-text return corrupts. Pair it with
+// write_bytes (contentBase64) for byte-exact read/write cycles.
+func handleReadBytes(_ context.Context, _ *mcp.CallToolRequest, in ReadBytesInput) (*mcp.CallToolResult, any, error) {
 	raw, err := os.ReadFile(in.Path)
 	if err != nil {
 		return toolError("read failed: %v", err)
@@ -335,7 +341,7 @@ func newServer() *mcp.Server {
 		Name:    "localtask",
 		Version: "v1.0.0",
 	}, &mcp.ServerOptions{
-		Instructions: "Host management server. Tools: exec (run shell commands), read/write/write_bytes (files), list (dirs), info (host), ps/df/mem (system stats), k8s (kubectl), download (file as base64). Use read/write for text, write_bytes/download for binary. All commands run as the server's OS user.",
+		Instructions: "Host management server. Tools: exec (run shell commands), read/write/write_bytes (files), read_bytes (binary-safe read, base64), list (dirs), info (host), ps/df/mem (system stats), k8s (kubectl). Use read/write for text, read_bytes/write_bytes for binary. Large files go over the HTTP /download and /upload endpoints (streaming, not via tools). All commands run as the server's OS user.",
 	})
 
 	// Host management tools (mirror of server.py).
@@ -345,7 +351,7 @@ func newServer() *mcp.Server {
 	}, handleExec)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "read",
-		Description: "Read a UTF-8 text file and return its contents.",
+		Description: "Read a UTF-8 text file and return its contents. For binary or non-UTF-8 files (NUL, invalid sequences), use read_bytes instead; for large files use the HTTP /download endpoint.",
 	}, handleRead)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "write",
@@ -380,9 +386,9 @@ func newServer() *mcp.Server {
 		Description: "Run a kubectl command. Defaults to 'kubectl get nodes'.",
 	}, handleK8s)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "download",
-		Description: "Read a file and return its raw bytes base64-encoded (binary-safe).",
-	}, handleDownload)
+		Name:        "read_bytes",
+		Description: "Read a file and return its raw bytes base64-encoded (binary-safe). Use for non-UTF-8 or NUL-containing files; pair with write_bytes for byte-exact roundtrips.",
+	}, handleReadBytes)
 
 	return s
 }
@@ -450,6 +456,8 @@ func main() {
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", handler)
+	mux.HandleFunc("/download", handleDownloadHTTP)
+	mux.HandleFunc("/upload", handleUploadHTTP)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"ok","transport":"streamable-http","endpoint":"/mcp"}`)
@@ -801,6 +809,262 @@ func selfSignedTLSConfig() (*tls.Config, string, error) {
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// sha256File computes the streaming SHA-256 of the file at path, returning the
+// lower-hex digest and the file size. It reads in 64 KiB chunks so GB files do
+// not require holding the whole content in memory.
+func sha256File(path string) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.CopyBuffer(h, f, make([]byte, 64*1024))
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// ----- HTTP streaming file transfer ----------------------------------------
+
+// uploadMu serializes concurrent uploads to the same destination path so that
+// interleaved Content-Range writes do not corrupt the assembled file. Different
+// paths are independent. In-process only (single binary instance).
+var (
+	uploadMuMu sync.Mutex
+	uploadMus  = map[string]*sync.Mutex{}
+)
+
+func uploadMutexFor(path string) *sync.Mutex {
+	uploadMuMu.Lock()
+	defer uploadMuMu.Unlock()
+	mu, ok := uploadMus[path]
+	if !ok {
+		mu = &sync.Mutex{}
+		uploadMus[path] = mu
+	}
+	return mu
+}
+
+// writeJSON writes a JSON body with the given status.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// parseContentRange parses "bytes start-end/total" (total may be "*").
+func parseContentRange(v string) (start, end, total int64, err error) {
+	v = strings.TrimSpace(v)
+	if !strings.HasPrefix(v, "bytes ") {
+		return 0, 0, 0, fmt.Errorf("not a bytes content-range: %q", v)
+	}
+	rest := strings.TrimPrefix(v, "bytes ")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, 0, fmt.Errorf("missing total in content-range: %q", v)
+	}
+	if parts[1] == "*" {
+		total = -1
+	} else {
+		total, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("bad total: %w", err)
+		}
+	}
+	se := strings.SplitN(parts[0], "-", 2)
+	if len(se) != 2 {
+		return 0, 0, 0, fmt.Errorf("missing end in content-range: %q", v)
+	}
+	start, err = strconv.ParseInt(se[0], 10, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad start: %w", err)
+	}
+	end, err = strconv.ParseInt(se[1], 10, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad end: %w", err)
+	}
+	return start, end, total, nil
+}
+
+// handleDownloadHTTP serves GET/HEAD file download with HTTP Range (resume,
+// multipart). HEAD returns X-File-Size and X-File-Sha256 (full-file, streamed).
+// ETag is the sha256 so clients may cache-validate.
+func handleDownloadHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET or HEAD only"})
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if !filepath.IsAbs(path) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path must be absolute"})
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found", "detail": err.Error()})
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "stat failed", "detail": err.Error()})
+		return
+	}
+	if fi.IsDir() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path is a directory"})
+		return
+	}
+	if r.Method == http.MethodHead {
+		sum, _, err := sha256File(path)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "hash failed", "detail": err.Error()})
+			return
+		}
+		w.Header().Set("X-File-Size", strconv.FormatInt(fi.Size(), 10))
+		w.Header().Set("X-File-Sha256", sum)
+		w.Header().Set("ETag", `"`+sum+`"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// GET: net/http handles Range / 206 / multipart-byteranges semantics.
+	w.Header().Set("Accept-Ranges", "bytes")
+	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
+}
+
+// handleUploadHTTP implements resumable uploads via PUT + Content-Range. Each
+// request writes its slice at offset `start` into temp file <path>.ltmp. The
+// final slice (end+1 == total) triggers full-file sha256 verification, then an
+// atomic rename into place. HEAD /upload?path= reports X-Received = current
+// temp-file length so a client can resume from the correct offset.
+func handleUploadHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if !filepath.IsAbs(path) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path must be absolute"})
+		return
+	}
+	tmp := path + ".ltmp" // stable suffix so resume finds prior progress
+
+	mu := uploadMutexFor(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if r.Method == http.MethodHead {
+		received := int64(0)
+		if info, err := os.Stat(tmp); err == nil {
+			received = info.Size()
+		}
+		w.Header().Set("X-Received", strconv.FormatInt(received, 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != http.MethodPut {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "PUT or HEAD only"})
+		return
+	}
+
+	cr := r.Header.Get("Content-Range")
+	if cr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Content-Range header required"})
+		return
+	}
+	start, end, total, err := parseContentRange(cr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad Content-Range", "detail": err.Error()})
+		return
+	}
+	if total < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Content-Range total must be known (not *)"})
+		return
+	}
+	if start < 0 || end < start || end+1 > total {
+		writeJSON(w, http.StatusRequestedRangeNotSatisfiable, map[string]string{"error": "invalid range"})
+		return
+	}
+
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "open temp", "detail": err.Error()})
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "seek failed", "detail": err.Error()})
+		return
+	}
+	expected := end - start + 1
+	n, err := io.CopyN(f, r.Body, expected)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "write failed", "detail": err.Error()})
+		return
+	}
+	if n != expected {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "short body", "detail": fmt.Sprintf("wrote %d, expected %d", n, expected)})
+		return
+	}
+	if err := f.Sync(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "sync failed", "detail": err.Error()})
+		return
+	}
+
+	// Not the final slice: report progress, keep temp file for resume.
+	if end+1 != total {
+		w.Header().Set("X-Received", strconv.FormatInt(end+1, 10))
+		writeJSON(w, http.StatusPartialContent, map[string]any{
+			"received": end + 1,
+			"total":     total,
+		})
+		return
+	}
+
+	// Final slice: verify full-file sha256, then rename into place.
+	if err := f.Close(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "close temp", "detail": err.Error()})
+		return
+	}
+	// Truncate any bytes beyond total left from a prior, larger upload.
+	if err := os.Truncate(tmp, total); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "truncate", "detail": err.Error()})
+		return
+	}
+	sum, size, err := sha256File(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "hash failed", "detail": err.Error()})
+		return
+	}
+	if want := r.Header.Get("X-Expected-Sha256"); want != "" {
+		if !strings.EqualFold(want, sum) {
+			_ = os.Remove(tmp)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error":  "checksum mismatch",
+				"detail": fmt.Sprintf("got %s", sum),
+			})
+			return
+		}
+	}
+	mode := 0o644
+	if m := r.URL.Query().Get("mode"); m != "" {
+		if parsed, err := strconv.ParseUint(m, 8, 32); err == nil {
+			mode = int(parsed)
+		}
+	}
+	_ = os.Chmod(tmp, os.FileMode(mode))
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "rename failed", "detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":   path,
+		"sha256": sum,
+		"size":   size,
+	})
 }
 
 // ----- Multi-key bearer auth ------------------------------------------------
